@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"flag"
-	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -21,11 +21,14 @@ import (
 	"github.com/sausheong/ble/linux"
 )
 
-var dur *time.Duration
-var dir *string
-var port *int
-var logger *log.Logger
-var stop bool = true
+var (
+	dur       *time.Duration
+	dir       *string
+	port      *int
+	logger         = log.Default()
+	stop      bool = true
+	templates      = map[string]*template.Template{}
+)
 
 // Device represents a BLE device
 type Device struct {
@@ -42,16 +45,20 @@ var mutex sync.RWMutex
 var devices map[string]Device
 
 func init() {
+	logger.Println("init")
 	devices = make(map[string]Device)
 	mutex = sync.RWMutex{}
-	d, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	d, err := os.Getwd()
 	if err != nil {
 		log.Fatal("Can't get running directory:", err)
 	}
+	d = filepath.Join(d, "public")
 	dir = flag.String("dir", d, "directory where the public directory is in")
 	dur = flag.Duration("d", 5*time.Second, "Scan duration")
 	port = flag.Int("p", 23232, "the port where the server starts")
 	flag.Parse()
+	templates["index"], _ = template.ParseFiles(filepath.Join(*dir, "index.html"))
+	templates["devices"], _ = template.ParseFiles(filepath.Join(*dir, "devices.html"))
 }
 
 func main() {
@@ -60,14 +67,17 @@ func main() {
 	if err != nil {
 		log.Println(err)
 	}
-	defer f.Close()
-	logger = log.New(f, "", log.LstdFlags)
+	// defer f.Close()
+
+	w := io.MultiWriter(f, os.Stdout)
+	logger = log.New(w, "blueblue: ", log.LstdFlags)
 
 	d, err := linux.NewDevice()
 	if err != nil {
 		logger.Fatal("Can't create new device:", err)
 	}
 	ble.SetDefaultDevice(d)
+	logger.Printf("Starting blueblue server, using device: %s\n", d.Address().String())
 	serve()
 }
 
@@ -89,7 +99,7 @@ func adScanHandler(a ble.Advertisement) {
 // start the web server
 func serve() {
 	mux := http.NewServeMux()
-	mux.Handle("/public/", http.StripPrefix("/public/", http.FileServer(http.Dir(*dir+"/public"))))
+	mux.Handle("/public/", http.StripPrefix("/public/", http.FileServer(http.Dir(*dir))))
 	mux.HandleFunc("/", index)
 	mux.HandleFunc("/stop", stopScan)
 	mux.HandleFunc("/start", startScan)
@@ -98,19 +108,21 @@ func serve() {
 		Addr:    "0.0.0.0:" + strconv.Itoa(*port),
 		Handler: mux,
 	}
-	fmt.Println("Started blueblue server at", server.Addr)
+	logger.Println("Started blueblue server at", server.Addr)
 	server.ListenAndServe()
 }
 
 // index for web server
 func index(w http.ResponseWriter, r *http.Request) {
-	t, _ := template.ParseFiles(*dir + "/public/index.html")
-	t.Execute(w, stop)
+	if err := templates["index"].Execute(w, stop); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		logger.Println("Error executing template:", err)
+	}
 }
 
 // handler to show list of devices
 func showDevices(w http.ResponseWriter, r *http.Request) {
-	t, _ := template.ParseFiles(*dir + "/public/devices.html")
+	t := templates["devices"]
 
 	// convert map to array, added detect since duration and
 	// remove anything that's more than 60 seconds
@@ -126,7 +138,10 @@ func showDevices(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(data, func(i, j int) bool {
 		return data[i].RSSI > data[j].RSSI
 	})
-	t.Execute(w, data)
+	if err := t.Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		logger.Println("Error executing template:", err)
+	}
 }
 
 // handler to start scanning
